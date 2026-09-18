@@ -1,0 +1,7 @@
+name = "sync-worker"
+main = "worker.js"
+compatibility_date = "2026-07-03"
+
+kv_namespaces = [
+  { binding = "SYNC_KV", id = "eaef794df1524f5da036145d284b074c" }
+]
