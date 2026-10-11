@@ -38,6 +38,16 @@ export default {
     }
 
     /* ─────────────────────────────
+       声のメモの預かり箱: /inbox
+       iPhone のショートカットが話した文を POST /inbox で預け、quick-ref が起動時に
+       GET /inbox で受け取り、メモにしたあと POST /inbox/ack で消す。
+       認証トークンが設定されていないWorkerでは使えない（誰でも書き込めてしまうため）。
+    ───────────────────────────── */
+    if (pathParts[0] === 'inbox') {
+      return handleInbox(request, env, corsHeaders, validToken, pathParts[1]);
+    }
+
+    /* ─────────────────────────────
        添付ファイル個別同期
        ルート: /attachments/<appName>/<attId>
        KVキー: attachments:<appName>:<attId>
@@ -293,4 +303,61 @@ async function handleAI(request, env, corsHeaders, validToken) {
     text = (d && d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content) || '';
   }
   return json({ text, provider, model }, 200);
+}
+
+/* ─────────────────────────────
+   声のメモの預かり箱
+   POST /inbox      本文 {"text":"…"}（または text/plain）を預ける。KV: inbox:<id>（90日で自動削除）
+   GET  /inbox      預かり中のものを古い順に最大40件返す
+   POST /inbox/ack  {"ids":[…]} 受け取り済みを消す（最大40件）
+───────────────────────────── */
+async function handleInbox(request, env, corsHeaders, validToken, sub) {
+  const json = (obj, status) => new Response(JSON.stringify(obj), {
+    status,
+    headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+  });
+  if (!validToken) return json({ error: '預かり箱は、認証トークンを設定したWorkerでだけ使えます' }, 503);
+  const PREFIX = 'inbox:', MAX_TEXT = 8000, MAX_PENDING = 200, BATCH = 40, TTL = 60 * 60 * 24 * 90;
+  const validId = x => typeof x === 'string' && /^in[a-z0-9]{6,24}$/.test(x);
+
+  if (request.method === 'GET' && !sub) {
+    const page = await env.SYNC_KV.list({ prefix: PREFIX, limit: BATCH });
+    const items = [];
+    for (const k of (page.keys || [])) {
+      let v = null;
+      try { v = JSON.parse(await env.SYNC_KV.get(k.name)); } catch (_) {}
+      if (v && validId(v.id) && typeof v.text === 'string') items.push({ id: v.id, text: v.text, createdAt: v.createdAt || 0 });
+    }
+    items.sort((a, b) => a.createdAt - b.createdAt);
+    return json({ items, more: page.list_complete === false }, 200);
+  }
+
+  if (request.method === 'POST' && sub === 'ack') {
+    let b; try { b = await request.json(); } catch (_) { return json({ error: 'JSONを読めませんでした' }, 400); }
+    const ids = (Array.isArray(b && b.ids) ? b.ids : []).filter(validId).slice(0, BATCH);
+    for (const id of ids) await env.SYNC_KV.delete(PREFIX + id);
+    return json({ ok: true, removed: ids.length }, 200);
+  }
+
+  if (request.method === 'POST' && !sub) {
+    const ct = (request.headers.get('Content-Type') || '').toLowerCase();
+    let text = '';
+    if (ct.includes('application/json')) {
+      let b; try { b = await request.json(); } catch (_) { return json({ error: 'JSONを読めませんでした' }, 400); }
+      text = typeof (b && b.text) === 'string' ? b.text : '';
+    } else {
+      try { text = await request.text(); } catch (_) {}
+    }
+    text = text.replace(/\r\n?/g, '\n').trim();
+    if (!text) return json({ error: '本文が空です' }, 400);
+    if (text.length > MAX_TEXT) return json({ error: '長すぎます（' + MAX_TEXT + '文字まで）' }, 413);
+    const pending = await env.SYNC_KV.list({ prefix: PREFIX, limit: MAX_PENDING });
+    if ((pending.keys || []).length >= MAX_PENDING) return json({ error: '未受け取りが多すぎます。quick-ref を開いて受け取ってください' }, 429);
+    const now = Date.now();
+    const id = 'in' + now.toString(36) + Math.random().toString(36).slice(2, 6);
+    await env.SYNC_KV.put(PREFIX + id, JSON.stringify({ id, text, createdAt: now }), { expirationTtl: TTL });
+    return json({ ok: true, id }, 200);
+  }
+
+  return json({ error: 'Method Not Allowed' }, 405);
 }
