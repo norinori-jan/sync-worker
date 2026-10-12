@@ -48,6 +48,13 @@ export default {
     }
 
     /* ─────────────────────────────
+       音声の文字起こし: POST /transcribe（Gemini が音声を直接読む。OpenAI は不要）
+    ───────────────────────────── */
+    if (pathParts[0] === 'transcribe') {
+      return handleTranscribe(request, env, corsHeaders, validToken);
+    }
+
+    /* ─────────────────────────────
        添付ファイル個別同期
        ルート: /attachments/<appName>/<attId>
        KVキー: attachments:<appName>:<attId>
@@ -360,4 +367,71 @@ async function handleInbox(request, env, corsHeaders, validToken, sub) {
   }
 
   return json({ error: 'Method Not Allowed' }, 405);
+}
+
+/* ─────────────────────────────
+   音声の文字起こし
+   POST /transcribe  {"data":"<base64>","mimeType":"audio/wav","mode":"clean"|"verbatim","model":"…"}
+   → {"text":"…"}。音声は保存しない。ログにも出さない。
+   1日の上限は /ai と共通（AI_DAILY_LIMIT）。音声は約10MB（base64で14MB）まで。
+───────────────────────────── */
+async function handleTranscribe(request, env, corsHeaders, validToken) {
+  const json = (obj, status) => new Response(JSON.stringify(obj), {
+    status,
+    headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+  });
+  const scrub = t => String(t || '')
+    .replace(/(sk-|AIza|ghp_|github_pat_)[A-Za-z0-9_\-*.]+/g, '…')
+    .replace(/\s+/g, ' ').slice(0, 200);
+  if (request.method !== 'POST') return json({ error: 'Method Not Allowed' }, 405);
+  if (!validToken) return json({ error: '文字起こしは、認証トークンを設定したWorkerでだけ使えます' }, 503);
+  const MAX_B64 = 14 * 1024 * 1024;
+  const len = Number(request.headers.get('Content-Length') || 0);
+  if (len && len > MAX_B64 + 4096) return json({ error: '音声が大きすぎます（約10MBまで）' }, 413);
+
+  let body;
+  try { body = await request.json(); } catch (_) { return json({ error: 'JSONを読めませんでした' }, 400); }
+  const data = body && body.data;
+  const mime = String((body && body.mimeType) || '').toLowerCase().split(';')[0].trim();
+  const model = String((body && body.model) || 'gemini-3.5-flash-lite');
+  const mode = body && body.mode === 'verbatim' ? 'verbatim' : 'clean';
+  const ALLOWED = ['audio/wav', 'audio/x-wav', 'audio/wave', 'audio/mpeg', 'audio/mp3', 'audio/mp4', 'audio/m4a', 'audio/x-m4a', 'audio/aac', 'audio/ogg', 'audio/flac', 'audio/webm'];
+  if (typeof data !== 'string' || !data) return json({ error: '音声(data)がありません' }, 400);
+  if (data.length > MAX_B64) return json({ error: '音声が大きすぎます（約10MBまで）' }, 413);
+  if (!/^[A-Za-z0-9+/=\s]+$/.test(data.slice(0, 2000))) return json({ error: '音声はbase64で送ってください' }, 400);
+  if (!ALLOWED.includes(mime)) return json({ error: 'mimeType が正しくありません' }, 400);
+  if (!/^[A-Za-z0-9._-]{3,60}$/.test(model)) return json({ error: 'model が正しくありません' }, 400);
+  const apiKey = env.GEMINI_API_KEY;
+  if (!apiKey) return json({ error: 'gemini のAPIキーがWorkerに登録されていません（GEMINI_API_KEY）' }, 503);
+
+  const limit = Math.max(1, Number(env.AI_DAILY_LIMIT) || 300);
+  const day = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
+  const usageKey = 'ai-usage:' + day;
+  let used = 0;
+  try { used = Number(await env.SYNC_KV.get(usageKey)) || 0; } catch (_) {}
+  if (used >= limit) return json({ error: '今日のAI呼び出し上限（' + limit + '回）に達しました' }, 429);
+  try { await env.SYNC_KV.put(usageKey, String(used + 1), { expirationTtl: 172800 }); } catch (_) {}
+
+  const instruction = mode === 'verbatim'
+    ? 'この音声を日本語で、聞こえたとおりに文字起こしして、本文だけを返してください。前置きや説明は付けません。聞き取れない所は［聞き取れず］と書きます。'
+    : 'この音声を日本語で文字起こしして、本文だけを返してください。前置きや説明は付けません。「えー」「あのー」などの言いよどみと、言い直しの前の部分は除き、句読点と改行を付けて読みやすくします。内容は変えず、言っていないことは足しません。聞き取れない所は［聞き取れず］と書きます。';
+  let res, d = null;
+  try {
+    res = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+      body: JSON.stringify({ contents: [{ parts: [{ text: instruction }, { inlineData: { mimeType: mime, data: data.replace(/\s+/g, '') } }] }] })
+    });
+  } catch (_) { return json({ error: 'Gemini に接続できませんでした' }, 502); }
+  try { d = await res.json(); } catch (_) {}
+  if (!res.ok) {
+    const e = d && d.error;
+    const msg = scrub((e && e.message) || '');
+    const status = (res.status === 401 || res.status === 403 || res.status >= 500) ? 502 : res.status;
+    return json({ error: 'gemini ' + res.status + (msg ? '：' + msg : '') }, status);
+  }
+  const parts = d && d.candidates && d.candidates[0] && d.candidates[0].content && d.candidates[0].content.parts;
+  const text = Array.isArray(parts) ? parts.map(p => (p && p.text) || '').join('').trim() : '';
+  if (!text) return json({ error: '文字を取り出せませんでした（無音か、形式が未対応の可能性があります）' }, 422);
+  return json({ text, model }, 200);
 }
