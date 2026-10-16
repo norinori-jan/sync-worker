@@ -27,12 +27,6 @@ export default {
 
     const url = new URL(request.url);
     const pathParts = url.pathname.split('/').filter(Boolean);
-    // アプリ名は英数字と . _ - だけ（':' を含められないので、inbox:… や attachments:… のキーに届かない）
-    const validApp = n => typeof n === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(n);
-    const badApp = () => new Response(JSON.stringify({ error: 'appName is invalid' }), {
-      status: 400,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-    });
 
     /* ─────────────────────────────
        AI 中継: POST /ai
@@ -79,7 +73,6 @@ export default {
         });
       }
 
-      if (!validApp(appName)) return badApp();
       const prefix = `attachments:${appName}:`;
 
       // 一覧取得（attIdなし）：差分同期のためのメタデータ一覧のみ返す
@@ -166,15 +159,12 @@ export default {
        既存: アイテム本体の同期（変更なし）
     ───────────────────────────── */
     const appName = pathParts.length > 0 ? pathParts[pathParts.length - 1] : 'flow-mind';
-    if (!validApp(appName)) return badApp();
-    const SYNC_PREFIX = 'sync:';   // 保存は sync:<アプリ名>。読むときは、無ければ従来の接頭辞なしのキーも見る（既存データを失わない）
 
     // 1. データ取得 (GET)
     // cloud-sync.js は { timestamp, data } という形のJSONを期待している。
     // KVには { timestamp, data } の形でそのまま保存しているので、そのまま返す。
     if (request.method === 'GET') {
-      let stored = await env.SYNC_KV.get(SYNC_PREFIX + appName);
-      if (!stored) stored = await env.SYNC_KV.get(appName);
+      const stored = await env.SYNC_KV.get(appName);
       if (!stored) {
         // データが無い場合は404を返す。cloud-sync.js側はこれをnull扱いする。
         return new Response(JSON.stringify({ error: 'Not Found' }), {
@@ -196,7 +186,7 @@ export default {
         const body = await request.json();
         const timestamp = Date.now();
         const record = { timestamp, data: body.data };
-        await env.SYNC_KV.put(SYNC_PREFIX + appName, JSON.stringify(record));
+        await env.SYNC_KV.put(appName, JSON.stringify(record));
         return new Response(JSON.stringify({ status: 'ok', timestamp }), {
           status: 200,
           headers: { ...corsHeaders, 'Content-Type': 'application/json' }
